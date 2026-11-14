@@ -24,11 +24,12 @@ block2(v9: i32):
 
 ; check:  block1(v2: i32):
 ;; constants are rematerialized in each block where used
-; check:      v10 = iconst.i32 40
-; check:      v11 = icmp eq v2, v10
-; check:      v12 = iconst.i32 1
-; check:      v13 = iadd v2, v12
-; check:      brif v11, block2, block1(v13)
+;; The integer backedge's argument is elaborated before its condition.
+; check:      v10 = iconst.i32 1
+; check:      v11 = iadd v2, v10
+; check:      v12 = iconst.i32 40
+; check:      v13 = icmp eq v2, v12
+; check:      brif v13, block2, block1(v11)
 
 
 ; check:  block2:

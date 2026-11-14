@@ -834,6 +834,27 @@ impl<'a> Elaborator<'a> {
             trace!(" -> inserting before {}", before);
 
             elab_values.extend(self.func.dfg.inst_values(inst));
+            // A loop's integer latch test often increments a loop-carried
+            // counter. Compute the backedge arguments first, before that
+            // increment: their old-counter uses can then finish before its
+            // register is updated, avoiding a copy on a split backedge.
+            let condition_last = match self.func.dfg.insts[inst] {
+                crate::ir::InstructionData::Brif { arg, blocks, .. } => {
+                    let condition = self.value_to_best_value[arg].1;
+                    matches!(
+                        self.func.dfg.value_def(condition),
+                        ValueDef::Result(compare, 0)
+                            if self.func.dfg.insts[compare].opcode() == crate::ir::Opcode::Icmp
+                    ) && blocks.iter().any(|target| {
+                        self.domtree
+                            .block_dominates(target.block(&self.func.dfg.value_lists), block)
+                    })
+                }
+                _ => false,
+            };
+            if condition_last {
+                elab_values.rotate_left(1);
+            }
             for arg in elab_values.iter_mut() {
                 trace!(" -> arg {}", *arg);
                 // Elaborate the arg, placing any newly-inserted insts
@@ -851,6 +872,9 @@ impl<'a> Elaborator<'a> {
                 );
                 trace!("   -> rewrote arg to {:?}", new_arg);
                 *arg = new_arg.value;
+            }
+            if condition_last {
+                elab_values.rotate_right(1);
             }
             self.func
                 .dfg
