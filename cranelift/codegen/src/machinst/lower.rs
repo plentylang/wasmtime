@@ -318,18 +318,15 @@ pub struct Lower<'func, I: VCodeInst> {
 /// account for this by treating a use of any result as a use of every
 /// result: as soon as a second result of the same instruction becomes
 /// used, all of its used results (and, transitively, its operand
-/// tree) become `Multiple`.
+/// tree, when it can be merged) become `Multiple`.
 ///
-/// To define `ValueUseState` more plainly: a value is `Unused` if no references
-/// exist to it; `Once` if only one other op refers to it, *and* that other op
-/// is `Unused` or `Once`, *and* no other result of the same instruction is
-/// used; and `Multiple` otherwise. In
-/// other words, `Multiple` is contagious: even if an op's result value is
-/// directly used only once in the CLIF, that value is `Multiple` if the op
-/// that uses it is itself used multiple times (hence could be codegen'd
-/// multiple times). In brief, this analysis tells us whether, if every op
-/// merged all of its operand tree, a given op could be codegen'd in more than
-/// one place.
+/// Direct uses include instruction operands, block arguments, and exception
+/// contexts. `Multiple` propagates through the producer's operand tree only
+/// when an instruction operand can merge that producer: block arguments and
+/// exception contexts always request registers instead. A producer passed to
+/// two successors is still `Multiple`, but its operands can remain `Once`
+/// when the producer itself is materialized exactly once. Multiple-result
+/// instructions remain conservative by counting against their first result.
 ///
 /// To compute this, we first consider direct uses. At this point
 /// `Unused` answers are correct, `Multiple` answers are correct, but
@@ -1425,6 +1422,10 @@ fn compute_use_states(
     // multiple times, it is pushed into `multiple_stack`, which we
     // use to do the graph-walk that propagates multiplicity below.
     let mut multiple_stack: SmallVec<[Value; 16]> = smallvec![];
+    // Block arguments and exception-table contexts are always materialized in
+    // registers. Only instruction-operand uses can merge their producer and
+    // duplicate its operand tree.
+    let mut merged_use: SecondaryMap<Value, bool> = SecondaryMap::with_default(false);
 
     if let Some(sret_param) = sret_param {
         // There's an implicit use of the struct-return parameter in each
@@ -1465,6 +1466,9 @@ fn compute_use_states(
             debug_assert!(f.dfg.value_is_real(arg));
             mark_use(arg, &mut multiple_stack);
         }
+        for &arg in f.dfg.inst_args(inst) {
+            merged_use[map_to_first_result(f, arg)] = true;
+        }
     }
 
     // Step 2: propagate multiplicity. `Multiple` is
@@ -1473,6 +1477,12 @@ fn compute_use_states(
     // their uses, and so on, depending on how deep a lowering rule
     // matches.
     while let Some(value) = multiple_stack.pop() {
+        // `collect_block_call` and `try_call_info` put these values in
+        // registers without merging their producer. The producer may have
+        // several register users, but its operand tree is lowered once.
+        if !merged_use[value] {
+            continue;
+        }
         for u in uses(value).into_iter().flatten() {
             mark_use(u, &mut multiple_stack);
         }
@@ -1805,6 +1815,115 @@ mod tests {
     use crate::cursor::{Cursor, FuncCursor};
     use crate::ir::types;
     use crate::ir::{Function, InstBuilder};
+
+    /// Both successors need the arithmetic value in a register; neither can
+    /// merge its instruction tree. The load may merge into the arithmetic.
+    #[test]
+    fn repeated_block_arguments_do_not_duplicate_operand_trees() {
+        branch_uses(false, false);
+    }
+
+    /// One actual instruction use of the arithmetic result restores conservative
+    /// propagation, even though its other use is a register-only block arg.
+    #[test]
+    fn mixed_block_and_instruction_uses_remain_conservative() {
+        branch_uses(true, false);
+    }
+
+    /// A genuinely shared load must never become eligible for sinking.
+    #[test]
+    fn shared_load_remains_multiple() {
+        branch_uses(false, true);
+    }
+
+    fn branch_uses(instruction_use: bool, shared_load: bool) {
+        use crate::ir::{AbiParam, MemFlagsData};
+        let mut func = Function::new();
+        func.signature.params.push(AbiParam::new(types::I64));
+        func.signature.returns.push(AbiParam::new(types::F64));
+        let entry = func.dfg.make_block();
+        let exit = func.dfg.make_block();
+        let ptr = func.dfg.append_block_param(entry, types::I64);
+        let result = func.dfg.append_block_param(exit, types::F64);
+        let mut pos = FuncCursor::new(&mut func);
+        pos.insert_block(entry);
+        let load = pos.ins().load(types::F64, MemFlagsData::new(), ptr, 0);
+        let product = pos.ins().fneg(load);
+        let other = if instruction_use {
+            pos.ins().fabs(product)
+        } else if shared_load {
+            pos.ins().fabs(load)
+        } else {
+            product
+        };
+        let condition = pos.ins().iconst(types::I8, 1);
+        pos.ins()
+            .brif(condition, exit, &[product.into()], exit, &[other.into()]);
+        pos.insert_block(exit);
+        pos.ins().return_(&[result]);
+        let flags = crate::settings::Flags::new(crate::settings::builder());
+        crate::verifier::verify_function(&pos.func, &flags).unwrap();
+        let uses = super::compute_use_states(&pos.func, None);
+        assert_eq!(
+            uses[load],
+            if instruction_use || shared_load {
+                ValueUseState::Multiple
+            } else {
+                ValueUseState::Once
+            }
+        );
+        assert_eq!(
+            uses[product],
+            if shared_load {
+                ValueUseState::Once
+            } else {
+                ValueUseState::Multiple
+            }
+        );
+    }
+
+    #[test]
+    fn exception_context_and_block_arg_are_register_only_uses() {
+        use crate::ir::{AbiParam, BlockCall, ExceptionTableData, ExceptionTableItem};
+        use crate::ir::{MemFlagsData, Signature};
+        use crate::isa::CallConv;
+        let mut func = Function::new();
+        func.signature.call_conv = CallConv::Tail;
+        func.signature.params.extend([AbiParam::new(types::I64); 2]);
+        func.signature.returns.push(AbiParam::new(types::I64));
+        let callee_sig = func.import_signature(Signature::new(CallConv::Tail));
+        let entry = func.dfg.make_block();
+        let exit = func.dfg.make_block();
+        let handler = func.dfg.make_block();
+        let ptr = func.dfg.append_block_param(entry, types::I64);
+        let callee = func.dfg.append_block_param(entry, types::I64);
+        let result = func.dfg.append_block_param(exit, types::I64);
+        let mut pos = FuncCursor::new(&mut func);
+        pos.insert_block(entry);
+        let load = pos.ins().load(types::I64, MemFlagsData::new(), ptr, 0);
+        let context = pos.ins().iadd_imm(load, 1);
+        let normal = BlockCall::new(exit, [context.into()], &mut pos.func.dfg.value_lists);
+        let caught = BlockCall::new(handler, [], &mut pos.func.dfg.value_lists);
+        let table = pos.func.dfg.exception_tables.push(ExceptionTableData::new(
+            callee_sig,
+            normal,
+            [
+                ExceptionTableItem::Context(context),
+                ExceptionTableItem::Default(caught),
+            ],
+        ));
+        pos.ins().try_call_indirect(callee, &[], table);
+        pos.insert_block(exit);
+        pos.ins().return_(&[result]);
+        pos.insert_block(handler);
+        let zero = pos.ins().iconst(types::I64, 0);
+        pos.ins().return_(&[zero]);
+        let flags = crate::settings::Flags::new(crate::settings::builder());
+        crate::verifier::verify_function(&pos.func, &flags).unwrap();
+        let uses = super::compute_use_states(&pos.func, None);
+        assert_eq!(uses[context], ValueUseState::Multiple);
+        assert_eq!(uses[load], ValueUseState::Once);
+    }
 
     #[test]
     fn multi_result_two_results_used_once_each() {
