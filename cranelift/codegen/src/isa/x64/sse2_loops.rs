@@ -1,6 +1,7 @@
 //! Keep scalar floating-point recurrences in their loop-header registers.
 //! SSE2 arithmetic overwrites its left operand.
 
+use crate::FxHashSet;
 use crate::cursor::{Cursor, FuncCursor};
 use crate::dominator_tree::DominatorTree;
 use crate::entity::{EntitySet, SecondaryMap};
@@ -14,7 +15,6 @@ enum Edit {
     },
     SaveBeforeSquare {
         square: Inst,
-        before: Inst,
         original: Value,
         branch: Inst,
         successor: usize,
@@ -45,21 +45,35 @@ pub(super) fn rewrite_recurrences(func: &Function, domtree: &DominatorTree) -> O
             if params.is_empty() || !domtree.dominates(header, block, &func.layout) {
                 continue;
             }
+            let mut edge_values = None;
             for (&previous, arg) in params.iter().zip(call.args(pool)) {
                 let BlockArg::Value(next) = arg else { continue };
                 if !matches!(func.dfg.value_type(next), types::F32 | types::F64) {
                     continue;
                 }
-                if let Some(product) = recurrence_product(func, next, previous) {
+                // The header redefines its parameters on every entry. A
+                // single static use in a nested loop can run repeatedly
+                // before the header is entered again.
+                if let Some(product) = recurrence_product(func, next, previous)
+                    && func.layout.inst_block(product) == Some(header)
+                {
                     edits.push(Edit::Commute { product, previous });
                 }
                 if let Some((square, original)) = square_of_accumulator(func, next, previous)
-                    && call.args(pool).any(|arg| arg == BlockArg::Value(original))
-                    && let Some(before) = square_insertion_point(func, square, next)
+                    && func.layout.inst_block(square) == Some(header)
+                    && edge_values
+                        .get_or_insert_with(|| {
+                            call.args(pool)
+                                .filter_map(|arg| match arg {
+                                    BlockArg::Value(value) => Some(value),
+                                    _ => None,
+                                })
+                                .collect::<FxHashSet<_>>()
+                        })
+                        .contains(&original)
                 {
                     edits.push(Edit::SaveBeforeSquare {
                         square,
-                        before,
                         original,
                         branch,
                         successor,
@@ -86,23 +100,44 @@ pub(super) fn rewrite_recurrences(func: &Function, domtree: &DominatorTree) -> O
             uses[arg] = uses[arg].saturating_add(1);
         }
     }
-    let mut split_blocks = EntitySet::new();
     let mut commuted = EntitySet::new();
-    edits.retain(|edit| match *edit {
-        Edit::Commute { product, previous } => uses[previous] == 1 && commuted.insert(product),
-        Edit::SaveBeforeSquare {
-            square, original, ..
-        } => uses[original] == 3 && split_blocks.insert(func.layout.inst_block(square).unwrap()),
-    });
-
-    if edits.is_empty() {
-        return None;
-    }
-    let mut func = func.clone();
+    let mut rewritten = None;
+    let mut split_blocks = EntitySet::new();
     for edit in edits {
-        edit.apply(&mut func);
+        match edit {
+            Edit::Commute { product, previous }
+                if uses[previous] == 1 && commuted.insert(product) =>
+            {
+                let rewritten = rewritten.get_or_insert_with(|| func.clone());
+                rewritten.dfg.inst_args_mut(product).swap(0, 1);
+            }
+            Edit::SaveBeforeSquare {
+                square,
+                original,
+                branch,
+                successor,
+            } if uses[original] == 3 => {
+                let block = func.layout.inst_block(square).unwrap();
+                // A failed search stops at the next instruction. A successful
+                // search reserves the block, bounding the total scan length.
+                if !split_blocks.contains(block)
+                    && let Some(before) = square_insertion_point(func, square)
+                {
+                    split_blocks.insert(block);
+                    split_before_square(
+                        rewritten.get_or_insert_with(|| func.clone()),
+                        square,
+                        before,
+                        original,
+                        branch,
+                        successor,
+                    );
+                }
+            }
+            _ => {}
+        }
     }
-    Some(func)
+    rewritten
 }
 
 fn recurrence_product(func: &Function, next: Value, previous: Value) -> Option<Inst> {
@@ -142,7 +177,8 @@ fn square_of_accumulator(func: &Function, next: Value, previous: Value) -> Optio
 
 /// Sink the square past independent scalar arithmetic so those instructions
 /// can finish using the old unsquared value before the preservation copy.
-fn square_insertion_point(func: &Function, square: Inst, result: Value) -> Option<Inst> {
+fn square_insertion_point(func: &Function, square: Inst) -> Option<Inst> {
+    let result = func.dfg.first_result(square);
     let next = func.layout.next_inst(square)?;
     let mut before = next;
     while matches!(
@@ -155,41 +191,37 @@ fn square_insertion_point(func: &Function, square: Inst, result: Value) -> Optio
     (before != next).then_some(before)
 }
 
-impl Edit {
-    fn apply(self, func: &mut Function) {
-        match self {
-            Self::Commute { product, .. } => func.dfg.inst_args_mut(product).swap(0, 1),
-            Self::SaveBeforeSquare {
-                square,
-                before,
-                original,
-                branch,
-                successor,
-            } => {
-                let block = func.layout.inst_block(before).unwrap();
-                let tail = func.dfg.make_block();
-                let ty = func.dfg.value_type(original);
-                let saved = func.dfg.append_block_param(tail, ty);
-                func.layout.split_block(tail, before);
-                func.layout.remove_inst(square);
-                func.layout.insert_inst(square, before);
-                let loc = func.srcloc(square);
-                let mut cursor = FuncCursor::new(func).with_srcloc(loc);
-                cursor.goto_bottom(block);
-                cursor.ins().jump(tail, &[BlockArg::Value(original)]);
-
-                let dfg = &mut cursor.func.dfg;
-                let call = &mut dfg.insts[branch]
-                    .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)
-                    [successor];
-                call.update_args(&mut dfg.value_lists, |arg| {
-                    if arg == BlockArg::Value(original) {
-                        BlockArg::Value(saved)
-                    } else {
-                        arg
-                    }
-                });
-            }
-        }
+fn split_before_square(
+    func: &mut Function,
+    square: Inst,
+    before: Inst,
+    original: Value,
+    branch: Inst,
+    successor: usize,
+) {
+    let block = func.layout.inst_block(before).unwrap();
+    let tail = func.dfg.make_block();
+    let ty = func.dfg.value_type(original);
+    let saved = func.dfg.append_block_param(tail, ty);
+    func.layout.split_block(tail, before);
+    if func.layout.is_cold(block) {
+        func.layout.set_cold(tail);
     }
+    func.layout.remove_inst(square);
+    func.layout.insert_inst(square, before);
+    let loc = func.srcloc(square);
+    let mut cursor = FuncCursor::new(func).with_srcloc(loc);
+    cursor.goto_bottom(block);
+    cursor.ins().jump(tail, &[BlockArg::Value(original)]);
+
+    let dfg = &mut cursor.func.dfg;
+    let call = &mut dfg.insts[branch]
+        .branch_destination_mut(&mut dfg.jump_tables, &mut dfg.exception_tables)[successor];
+    call.update_args(&mut dfg.value_lists, |arg| {
+        if arg == BlockArg::Value(original) {
+            BlockArg::Value(saved)
+        } else {
+            arg
+        }
+    });
 }

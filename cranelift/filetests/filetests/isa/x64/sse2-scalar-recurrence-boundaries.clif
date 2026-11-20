@@ -1,0 +1,243 @@
+test compile precise-output
+set opt_level=speed
+set regalloc_checker=true
+target x86_64
+
+;; The outer parameter is reused in every inner iteration. The product
+;; must keep accumulating in the inner parameter's register.
+function %nested(f64, f64, i64, i64) -> f64 {
+block0(v0: f64, v1: f64, v2: i64, v3: i64):
+    v12 = iconst.i64 1
+    jump block1(v0, v2)
+block1(v4: f64, v5: i64):
+    jump block2(v1, v3)
+block2(v6: f64, v7: i64):
+    v8 = fadd v6, v6
+    v9 = fmul v8, v4
+    v10 = isub v7, v12
+    brif v10, block2(v9, v10), block3
+block3:
+    v11 = isub v5, v12
+    brif v11, block1(v9, v11), block4
+block4:
+    return v9
+}
+
+; VCode:
+;   pushq %rbp
+;   movq %rsp, %rbp
+; block0:
+;   movdqa %xmm0, %xmm2
+;   jmp     label1
+; block1:
+;   movq %rsi, %rax
+;   movdqa %xmm1, %xmm0
+;   jmp     label2
+; block2:
+;   subq $0x1, %rax
+;   addsd %xmm0, %xmm0
+;   mulsd %xmm2, %xmm0
+;   testq %rax, %rax
+;   jnz     label3; j label4
+; block3:
+;   jmp     label2
+; block4:
+;   subq $0x1, %rdi
+;   testq %rdi, %rdi
+;   jnz     label5; j label6
+; block5:
+;   movdqa %xmm0, %xmm2
+;   jmp     label1
+; block6:
+;   movq %rbp, %rsp
+;   popq %rbp
+;   retq
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   pushq %rbp
+;   movq %rsp, %rbp
+; block1: ; offset 0x4
+;   movdqa %xmm0, %xmm2
+; block2: ; offset 0x8
+;   movq %rsi, %rax
+;   movdqa %xmm1, %xmm0
+; block3: ; offset 0xf
+;   subq $1, %rax
+;   addsd %xmm0, %xmm0
+;   mulsd %xmm2, %xmm0
+;   testq %rax, %rax
+;   jne 0xf
+; block4: ; offset 0x24
+;   subq $1, %rdi
+;   testq %rdi, %rdi
+;   je 0x3a
+; block5: ; offset 0x31
+;   movdqa %xmm0, %xmm2
+;   jmp 8
+; block6: ; offset 0x3a
+;   movq %rbp, %rsp
+;   popq %rbp
+;   retq
+
+;; Both halves of the split loop body must stay in the cold layout,
+;; after the hot return.
+function %cold_escape(f64, f64) -> i8 tail {
+    const0 = 0x00000000000000004010000000000000
+
+block0(v0: f64, v1: f64):
+    jump block2
+
+block3:
+    v4 = f64const 0.0
+    v9 = iconst.i64 50
+    v41 = f64const 0x1.0000000000000p2
+    v10 = iconst.i64 1
+    jump block4(v4, v4, v4, v4, v9)
+
+block4(v27: f64, v29: f64, v33: f64, v34: f64, v43: i64) cold:
+    v35 = fsub v33, v34
+    v37 = fadd v35, v0
+    v38 = fmul v37, v37
+    v28 = fadd v27, v27
+    v30 = fmul v28, v29
+    v32 = fadd v30, v1
+    v39 = fmul v32, v32
+    v40 = fadd v38, v39
+    v105 = f64const 0x1.0000000000000p2
+    v106 = fcmp gt v40, v105
+    brif v106, block7, block8
+
+block7:
+    jump block1(v38, v39)
+
+block8:
+    jump block6
+
+block6:
+    jump block5
+
+block5:
+    v107 = iconst.i64 1
+    v108 = isub.i64 v43, v107
+    brif v108, block4(v37, v32, v38, v39, v108), block1(v38, v39)
+
+block2:
+    jump block3
+
+block1(v59: f64, v60: f64):
+    v61 = fadd v59, v60
+    v63 = vconst.f64x2 const0
+    v64 = extractlane v63, 0
+    v65 = fcmp le v61, v64
+    return v65
+}
+
+; VCode:
+;   pushq %rbp
+;   movq %rsp, %rbp
+; block0:
+;   jmp     label1
+; block1:
+;   jmp     label2
+; block2:
+;   uninit  %xmm2
+;   xorpd %xmm2, %xmm2
+;   movl $0x32, %eax
+;   movdqa %xmm2, %xmm3
+;   movdqa %xmm2, %xmm4
+;   movdqa %xmm2, %xmm5
+;   jmp     label3
+; block5:
+;   jmp     label6
+; block6:
+;   jmp     label7
+; block7:
+;   subq $0x1, %rax
+;   testq %rax, %rax
+;   jnz     label8; j label9
+; block9:
+;   jmp     label11
+; block10:
+;   jmp     label11
+; block11:
+;   movupd (%rip), %xmm0
+;   ucomisd %xmm6, %xmm0
+;   setae %al
+;   movq %rbp, %rsp
+;   popq %rbp
+;   retq
+; block3:
+;   subsd %xmm5, %xmm4
+;   addsd %xmm0, %xmm4
+;   addsd %xmm2, %xmm2
+;   mulsd %xmm2, %xmm3
+;   addsd %xmm1, %xmm3
+;   movdqa %xmm3, %xmm5
+;   mulsd %xmm3, %xmm5
+;   jmp     label4
+; block4:
+;   movdqa %xmm4, %xmm2
+;   mulsd %xmm4, %xmm4
+;   movdqa %xmm4, %xmm6
+;   addsd %xmm5, %xmm6
+;   ucomisd (%rip), %xmm6
+;   jnbe    label10; j label5
+; block8:
+;   jmp     label3
+;
+; Disassembled:
+; block0: ; offset 0x0
+;   pushq %rbp
+;   movq %rsp, %rbp
+; block1: ; offset 0x4
+;   xorpd %xmm2, %xmm2
+;   movl $0x32, %eax
+;   movdqa %xmm2, %xmm3
+;   movdqa %xmm2, %xmm4
+;   movdqa %xmm2, %xmm5
+;   jmp 0x3f
+; block2: ; offset 0x1e
+;   subq $1, %rax
+;   testq %rax, %rax
+;   jne 0x3f
+; block3: ; offset 0x2b
+;   movupd 0x4d(%rip), %xmm0
+;   ucomisd %xmm6, %xmm0
+;   setae %al
+;   movq %rbp, %rsp
+;   popq %rbp
+;   retq
+; block4: ; offset 0x3f
+;   subsd %xmm5, %xmm4
+;   addsd %xmm0, %xmm4
+;   addsd %xmm2, %xmm2
+;   mulsd %xmm2, %xmm3
+;   addsd %xmm1, %xmm3
+;   movdqa %xmm3, %xmm5
+;   mulsd %xmm3, %xmm5
+; block5: ; offset 0x5b
+;   movdqa %xmm4, %xmm2
+;   mulsd %xmm4, %xmm4
+;   movdqa %xmm4, %xmm6
+;   addsd %xmm5, %xmm6
+;   ucomisd 0x1d(%rip), %xmm6
+;   ja 0x2b
+;   jmp 0x1e
+; block6: ; offset 0x7e
+;   addb %al, (%rax)
+;   addb %al, (%rax)
+;   addb %al, (%rax)
+;   addb %al, (%rax)
+;   adcb %al, (%rax)
+;   addb %al, (%rax)
+;   addb %al, (%rax)
+;   addb %al, (%rax)
+;   addb %al, (%rax)
+;   addb %al, (%rax)
+;   addb %al, (%rax)
+;   addb %dl, (%rax)
+;   addb %al, (%rax)
+;   addb %al, (%rax)
+;   addb %al, (%rax)
+;   addb %al, (%rax)
