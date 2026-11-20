@@ -26,6 +26,7 @@ mod abi;
 mod inst;
 mod lower;
 pub mod settings;
+mod sse2_loops;
 mod ymm;
 
 #[cfg(feature = "unwind")]
@@ -94,6 +95,22 @@ impl TargetIsa for X64Backend {
         ctrl_plane: &mut ControlPlane,
     ) -> CodegenResult<CompiledCodeStencil> {
         ymm::check_function(func, &self.flags, &self.x64_flags, &self.triple)?;
+        let rewritten = if self.flags.opt_level() != shared_settings::OptLevel::None
+            && self.flags.regalloc_algorithm() == shared_settings::RegallocAlgorithm::Backtracking
+            && !self.x64_flags.has_avx()
+        {
+            sse2_loops::rewrite_recurrences(func, domtree)
+        } else {
+            None
+        };
+        let rewritten_domtree;
+        let (func, domtree) = if let Some(func) = &rewritten {
+            let cfg = crate::flowgraph::ControlFlowGraph::with_function(func);
+            rewritten_domtree = DominatorTree::with_function(func, &cfg);
+            (func, &rewritten_domtree)
+        } else {
+            (func, domtree)
+        };
         let vcode = self.compile_vcode(func, domtree, regalloc_ctx, ctrl_plane)?;
 
         let emit_result = vcode.emit(&regalloc_ctx.output, want_disasm, &self.flags, ctrl_plane)?;
