@@ -35,32 +35,44 @@ pub(super) fn rewrite_recurrences(func: &Function, domtree: &DominatorTree) -> O
         }
 
         let pool = &func.dfg.value_lists;
-        for (successor, call) in data
-            .branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables)
-            .iter()
-            .enumerate()
-        {
+        let destinations =
+            data.branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
+        for (successor, call) in destinations.iter().enumerate() {
             let header = call.block(pool);
             let params = func.dfg.block_params(header);
             if params.is_empty() || !domtree.dominates(header, block, &func.layout) {
                 continue;
             }
+            // The header redefines its parameters on entry. Its latch also
+            // executes at most once per entry if all other exits terminate.
+            // A single static use elsewhere could execute in a nested loop.
+            let latch_is_once_per_entry = block != header
+                && destinations.iter().all(|destination| {
+                    let target = destination.block(pool);
+                    target == header
+                        || func.layout.last_inst(target).is_some_and(|inst| {
+                            matches!(func.dfg.insts[inst].opcode(), Opcode::Return | Opcode::Trap)
+                        })
+                });
+            let executes_once_per_entry = |inst| {
+                func.layout.inst_block(inst).is_some_and(|location| {
+                    location == header || (location == block && latch_is_once_per_entry)
+                })
+            };
+
             let mut edge_values = None;
             for (&previous, arg) in params.iter().zip(call.args(pool)) {
                 let BlockArg::Value(next) = arg else { continue };
                 if !matches!(func.dfg.value_type(next), types::F32 | types::F64) {
                     continue;
                 }
-                // The header redefines its parameters on every entry. A
-                // single static use in a nested loop can run repeatedly
-                // before the header is entered again.
                 if let Some(product) = recurrence_product(func, next, previous)
-                    && func.layout.inst_block(product) == Some(header)
+                    && executes_once_per_entry(product)
                 {
                     edits.push(Edit::Commute { product, previous });
                 }
                 if let Some((square, original)) = square_of_accumulator(func, next, previous)
-                    && func.layout.inst_block(square) == Some(header)
+                    && executes_once_per_entry(square)
                     && edge_values
                         .get_or_insert_with(|| {
                             call.args(pool)
